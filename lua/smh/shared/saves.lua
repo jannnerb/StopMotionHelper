@@ -60,6 +60,7 @@ local function ProcessKeyframes(keyframes, entityMappedKeyframes, properties, pl
             Position = keyframe.Frame,
             EaseIn = table.Copy(keyframe.EaseIn),
             EaseOut = table.Copy(keyframe.EaseOut),
+            Curve = table.Copy(keyframe.Curve or {}),
             EntityData = table.Copy(keyframe.Modifiers),
         })
     end

@@ -93,5 +93,6 @@ end
 cleanup.Register("smhentity")
 CreateConVar("sbox_maxsmhentity", 20, FCVAR_NOTIFY)
 
+include("shared/curves.lua")
 include("shared/saves.lua")
 include("shared/tablesplit.lua")

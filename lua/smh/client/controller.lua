@@ -5,14 +5,16 @@ local function ReceiveKeyframes()
     local framecount = net.ReadUInt(INT_BITCOUNT)
     for i = 1, framecount do
         local ID, entity, Frame, ModCount = net.ReadUInt(INT_BITCOUNT), net.ReadEntity(), net.ReadUInt(INT_BITCOUNT), net.ReadUInt(INT_BITCOUNT)
-        local Modifiers, In, Out = {}, {}, {}
+        local Modifiers, In, Out, Curve = {}, {}, {}, {}
         for j = 1, ModCount do
             local name = net.ReadString()
             Modifiers[name] = true
             In[name] = net.ReadFloat()
             Out[name] = net.ReadFloat()
+            local curve = net.ReadString()
+            Curve[name] = curve ~= "" and curve or nil
         end
-        SMH.TableSplit.AKeyframes(ID, entity, Frame, In, Out, Modifiers)
+        SMH.TableSplit.AKeyframes(ID, entity, Frame, In, Out, Modifiers, Curve)
     end
     return SMH.TableSplit.GetKeyframes()
 end
@@ -105,6 +107,8 @@ function CTRL.UpdateKeyframe(keyframeId, updateData, singledata)
                     net.WriteString(data)
                     if data == "Frame" then
                         net.WriteUInt(value, INT_BITCOUNT)
+                    elseif data == "Curve" then
+                        net.WriteString(value)
                     else
                         net.WriteFloat(value)
                     end
@@ -114,6 +118,8 @@ function CTRL.UpdateKeyframe(keyframeId, updateData, singledata)
                     net.WriteString(data)
                     if data == "Frame" then
                         net.WriteUInt(value, INT_BITCOUNT)
+                    elseif data == "Curve" then
+                        net.WriteString(value)
                     else
                         net.WriteFloat(value)
                     end

@@ -39,6 +39,7 @@ local function ClearModifier(keyframe, modname)
     keyframe.Modifiers[modname] = nil
     keyframe.EaseIn[modname] = nil
     keyframe.EaseOut[modname] = nil
+    keyframe.Curve[modname] = nil
 end
 
 hook.Add("EntityRemoved", "SMHKeyframesEntityRemoved", function(entity)
@@ -147,16 +148,19 @@ function MGR.Update(player, keyframeIds, updateData, timeline)
             "Frame",
             "EaseIn",
             "EaseOut",
+            "Curve",
         }
         for _, field in pairs(updateableFields) do
             if updateData[id][field] then
                 if field == "Frame" then
                     if updateData[id][field] == keyframe.Frame then continue end
                     local remainmods, EaseIn, EaseOut, frame = table.Copy(keyframe.Modifiers), table.Copy(keyframe.EaseIn), table.Copy(keyframe.EaseOut), updateData[id][field]
+                    local Curve = table.Copy(keyframe.Curve)
                     for _, name in ipairs(modnames) do
                         remainmods[name] = nil
                         EaseIn[name] = nil
                         EaseOut[name] = nil
+                        Curve[name] = nil
                     end
 
                     if next(remainmods) then -- if there are any modifiers remaining, then we create another keyframe that will stay there
@@ -169,11 +173,18 @@ function MGR.Update(player, keyframeIds, updateData, timeline)
                         remainkeyframe.Modifiers = remainmods
                         remainkeyframe.EaseIn = EaseIn
                         remainkeyframe.EaseOut = EaseOut
+                        remainkeyframe.Curve = Curve
                     end
 
                     movingkeyframes[keyframe] = frame
                 else
                     for _, name in ipairs(modnames) do
+                        if field == "Curve" then
+                            local curve = updateData[id][field]
+                            if not keyframe.Modifiers[name] or not SMH.Curves.IsValid(curve) then continue end
+                            keyframe.Curve[name] = curve ~= "" and curve or nil
+                            continue
+                        end
                         if not keyframe[field][name] then continue end
                         keyframe[field][name] = updateData[id][field]
                     end
@@ -193,6 +204,7 @@ function MGR.Update(player, keyframeIds, updateData, timeline)
                     keyframe.Modifiers[name] = data
                     keyframe.EaseIn[name] = replacekey.EaseIn[name]
                     keyframe.EaseOut[name] = replacekey.EaseOut[name]
+                    keyframe.Curve[name] = replacekey.Curve[name]
                 end
             end
             SMH.KeyframeData:Delete(player, replacekey.ID)
@@ -215,11 +227,12 @@ function MGR.Copy(player, keyframeIds, frame, timeline)
         local keyframe = SMH.KeyframeData.Players[player].Keyframes[keyframeId]
         local modnames = player == keyframe.Entity and {"world"} or SMH.Properties.Players[player].TimelineSetting.TimelineMods[timeline]
 
-        local EaseIn, EaseOut, Mods = {}, {}, {}
+        local EaseIn, EaseOut, Curve, Mods = {}, {}, {}, {}
         for _, name in ipairs(modnames) do
             if not keyframe.Modifiers[name] then continue end
             EaseIn[name] = keyframe.EaseIn[name]
             EaseOut[name] = keyframe.EaseOut[name]
+            Curve[name] = keyframe.Curve[name]
             if istable(keyframe.Modifiers[name]) then
                 Mods[name] = table.Copy(keyframe.Modifiers[name]) -- in case if we copy things like world keyframes
             else
@@ -230,6 +243,7 @@ function MGR.Copy(player, keyframeIds, frame, timeline)
         local copiedKeyframe = SMH.KeyframeData:New(player, keyframe.Entity)
         copiedKeyframe.EaseIn = EaseIn
         copiedKeyframe.EaseOut = EaseOut
+        copiedKeyframe.Curve = Curve
         copiedKeyframe.Modifiers = Mods
 
         movingkeyframes[copiedKeyframe] = frame[id]
@@ -244,6 +258,7 @@ function MGR.Copy(player, keyframeIds, frame, timeline)
                     keyframe.Modifiers[name] = data
                     keyframe.EaseIn[name] = replacekey.EaseIn[name]
                     keyframe.EaseOut[name] = replacekey.EaseOut[name]
+                    keyframe.Curve[name] = replacekey.Curve[name]
                 end
             end
             SMH.KeyframeData:Delete(player, replacekey.ID)
@@ -293,6 +308,7 @@ function MGR.ImportSave(player, entity, serializedKeyframes, entityProperties)
             for name, _ in pairs(skf.EntityData) do
                 keyframe.EaseIn[name] = type(skf.EaseIn) == "table" and skf.EaseIn[name] or skf.EaseIn
                 keyframe.EaseOut[name] = type(skf.EaseOut) == "table" and skf.EaseOut[name] or skf.EaseOut
+                keyframe.Curve[name] = type(skf.Curve) == "table" and skf.Curve[name] or nil
                 keyframe.Modifiers[name] = skf.EntityData[name]
             end
         else
@@ -301,6 +317,7 @@ function MGR.ImportSave(player, entity, serializedKeyframes, entityProperties)
             for name, _ in pairs(skf.EntityData) do
                 keyframe.EaseIn[name] = type(skf.EaseIn) == "table" and skf.EaseIn[name] or skf.EaseIn
                 keyframe.EaseOut[name] = type(skf.EaseOut) == "table" and skf.EaseOut[name] or skf.EaseOut
+                keyframe.Curve[name] = type(skf.Curve) == "table" and skf.Curve[name] or nil
                 keyframe.Modifiers[name] = skf.EntityData[name]
             end
         end

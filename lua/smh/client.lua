@@ -2,6 +2,7 @@ include("shared.lua")
 
 include("client/state.lua")
 
+include("client/derma/curve_editor.lua")
 include("client/derma/frame_panel.lua")
 include("client/derma/frame_pointer.lua")
 include("client/derma/load.lua")

@@ -268,6 +268,18 @@ local function AddCallbacks()
         LoadMenu:SetVisible(true)
         SMH.Controller.GetServerSaves()
     end
+    WorldClicker.MainMenu.OnRequestToggleCurveEditor = function()
+        WorldClicker.CurveEditor:SetVisible(not WorldClicker.CurveEditor:IsVisible())
+    end
+    WorldClicker.MainMenu.OnEasingShown = function(_, curve)
+        WorldClicker.CurveEditor:SetCurve(curve)
+    end
+    WorldClicker.MainMenu.OnEasingHidden = function()
+        WorldClicker.CurveEditor:SetActive(false)
+    end
+    WorldClicker.CurveEditor.OnCurveChanged = function(_, curve)
+        WorldClicker.MainMenu:OnRequestKeyframeUpdate({ Curve = curve })
+    end
     WorldClicker.MainMenu.OnRequestOpenSettings = function()
         WorldClicker.Settings:ApplySettings(SMH.Settings.GetAll())
         WorldClicker.Settings:SetVisible(true)
@@ -426,6 +438,10 @@ hook.Add("InitPostEntity", "SMHMenuSetup", function()
     WorldClicker.Settings:SetPos(ScrW() - 250, ScrH() - 90 - 290)
     WorldClicker.Settings:SetVisible(false)
 
+    WorldClicker.CurveEditor = vgui.Create("SMHCurveEditor", WorldClicker)
+    WorldClicker.CurveEditor:SetPos(ScrW() - 250 - 310, ScrH() - 90 - 330)
+    WorldClicker.CurveEditor:SetVisible(false)
+
     WorldClicker.PhysRecorder = vgui.Create("SMHPhysRecord", WorldClicker)
     WorldClicker.PhysRecorder:SetPos(ScrW() - 250 - 250, ScrH() - 90 - 170)
     WorldClicker.PhysRecorder:SetVisible(false)
@@ -480,7 +496,7 @@ function MGR.SetFrame(frame)
         if FrameToKeyframe[frame] ~= nil then
             local data = KeyframeEasingData[FrameToKeyframe[frame]]
             if data then
-                WorldClicker.MainMenu:ShowEasingControls(data.EaseIn, data.EaseOut)
+                WorldClicker.MainMenu:ShowEasingControls(data.EaseIn, data.EaseOut, data.Curve)
             else
                 WorldClicker.MainMenu:ShowEasingControls(0, 0)
             end
@@ -528,6 +544,7 @@ function MGR.SetKeyframes(keyframes, isreceiving)
                         KeyframeEasingData[LocalIDs] = {
                             EaseIn = keyframe.EaseIn[name],
                             EaseOut = keyframe.EaseOut[name],
+                            Curve = keyframe.Curve and keyframe.Curve[name],
                         }
                         KeyframeIDs[keyframe.ID] = LocalIDs
                         LocalIDs = LocalIDs + 1
@@ -544,7 +561,7 @@ function MGR.SetKeyframes(keyframes, isreceiving)
         if FrameToKeyframe[SMH.State.Frame] ~= nil then
             local data = KeyframeEasingData[FrameToKeyframe[SMH.State.Frame]]
             if data then
-                WorldClicker.MainMenu:ShowEasingControls(data.EaseIn, data.EaseOut)
+                WorldClicker.MainMenu:ShowEasingControls(data.EaseIn, data.EaseOut, data.Curve)
             else
                 WorldClicker.MainMenu:ShowEasingControls(0, 0)
             end
@@ -562,6 +579,7 @@ function MGR.SetKeyframes(keyframes, isreceiving)
                 KeyframeEasingData[LocalIDs] = {
                     EaseIn = keyframe.EaseIn["world"],
                     EaseOut = keyframe.EaseOut["world"],
+                    Curve = keyframe.Curve and keyframe.Curve["world"],
                 }
                 KeyframeIDs[keyframe.ID] = LocalIDs
                 LocalIDs = LocalIDs + 1
@@ -598,6 +616,7 @@ function MGR.UpdateKeyframe(keyframe)
     KeyframeEasingData[KeyframeIDs[keyframe.ID]] = {
         EaseIn = keyframe.EaseIn[name],
         EaseOut = keyframe.EaseOut[name],
+        Curve = keyframe.Curve and keyframe.Curve[name],
     }
 
     KeyframePointers[KeyframeIDs[keyframe.ID]]:SetFrame(keyframe.Frame)
@@ -610,7 +629,7 @@ function MGR.UpdateKeyframe(keyframe)
     end
     FrameToKeyframe[keyframe.Frame] = KeyframeIDs[keyframe.ID]
     if keyframe.Frame == SMH.State.Frame then
-        WorldClicker.MainMenu:ShowEasingControls(keyframe.EaseIn[name], keyframe.EaseOut[name])
+        WorldClicker.MainMenu:ShowEasingControls(keyframe.EaseIn[name], keyframe.EaseOut[name], keyframe.Curve and keyframe.Curve[name])
     end
 end
 

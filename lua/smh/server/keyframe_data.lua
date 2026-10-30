@@ -30,7 +30,7 @@ function SMH.GetClosestKeyframes(keyframes, frame, ignoreCurrentFrame, modname)
     local lerpMultiplier = 0
     if prevKeyframe.Frame ~= nextKeyframe.Frame then
         lerpMultiplier = (frame - prevKeyframe.Frame) / (nextKeyframe.Frame - prevKeyframe.Frame)
-        lerpMultiplier = math.EaseInOut(lerpMultiplier, prevKeyframe.EaseOut[modname], nextKeyframe.EaseIn[modname])
+        lerpMultiplier = SMH.ApplyEasing(prevKeyframe, nextKeyframe, modname, lerpMultiplier)
     end
 
     return prevKeyframe, nextKeyframe, lerpMultiplier
@@ -46,6 +46,7 @@ function META:New(player, entity)
         Frame = -1,
         EaseIn = {},
         EaseOut = {},
+        Curve = {},
         Modifiers = {}
     }
     self.NextKeyframeId = self.NextKeyframeId + 1

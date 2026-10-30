@@ -68,6 +68,10 @@ function PANEL:Init()
     self.EaseOutControl.Label:SetText("Ease out")
     self.EaseOutControl.Label:SizeToContents()
 
+    self.CurveButton = vgui.Create("DButton", self.Easing)
+    self.CurveButton:SetText("Curve")
+    self.CurveButton.DoClick = function() self:OnRequestToggleCurveEditor() end
+
     self.RecordButton = vgui.Create("DButton", self)
     self.RecordButton:SetText("Record")
     self.RecordButton.DoClick = function() self:OnRequestRecord() end
@@ -119,7 +123,7 @@ function PANEL:PerformLayout(width, height)
     self.PlaybackLengthControl.Label:SetRelativePos(self.PlaybackLengthControl, -(sizeX) - 5, 3)
 
     self.Easing:SetPos(540, 0)
-    self.Easing:SetSize(250, 30)
+    self.Easing:SetSize(330, 30)
 
     self.EaseInControl:SetPos(60, 2)
     self.EaseInControl:SetSize(50, 20)
@@ -130,6 +134,9 @@ function PANEL:PerformLayout(width, height)
     self.EaseOutControl:SetSize(50, 20)
     sizeX, sizeY = self.EaseOutControl.Label:GetSize()
     self.EaseOutControl.Label:SetRelativePos(self.EaseOutControl, -(sizeX) - 5, 3)
+
+    self.CurveButton:SetPos(225, 2)
+    self.CurveButton:SetSize(60, 20)
 
     self.RecordButton:SetPos(width - 60 * 5 - 5 * 5, 2)
     self.RecordButton:SetSize(60, 20)
@@ -202,17 +209,23 @@ function PANEL:UpdatePositionLabel(frame, totalFrames)
     self.PositionLabel:SizeToContents()
 end
 
-function PANEL:ShowEasingControls(easeIn, easeOut)
+function PANEL:ShowEasingControls(easeIn, easeOut, curve)
     self._sendKeyframeChanges = false
     self.EaseInControl:SetValue(easeIn)
     self.EaseOutControl:SetValue(easeOut)
     self.Easing:SetVisible(true)
     self._sendKeyframeChanges = true
+    self:OnEasingShown(curve)
 end
 
 function PANEL:HideEasingControls()
     self.Easing:SetVisible(false)
+    self:OnEasingHidden()
 end
+
+function PANEL:OnEasingShown(curve) end
+function PANEL:OnEasingHidden() end
+function PANEL:OnRequestToggleCurveEditor() end
 
 function PANEL:OnRequestStateUpdate(newState) end
 function PANEL:OnRequestKeyframeUpdate(newKeyframeData) end

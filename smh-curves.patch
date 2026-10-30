@@ -1,0 +1,1027 @@
+diff --git a/lua/smh/client.lua b/lua/smh/client.lua
+index 182fd57..4a0e51f 100644
+--- a/lua/smh/client.lua
++++ b/lua/smh/client.lua
+@@ -2,6 +2,7 @@ include("shared.lua")
+ 
+ include("client/state.lua")
+ 
++include("client/derma/curve_editor.lua")
+ include("client/derma/frame_panel.lua")
+ include("client/derma/frame_pointer.lua")
+ include("client/derma/load.lua")
+diff --git a/lua/smh/client/controller.lua b/lua/smh/client/controller.lua
+index ba0aac6..d372ea7 100644
+--- a/lua/smh/client/controller.lua
++++ b/lua/smh/client/controller.lua
+@@ -5,14 +5,16 @@ local function ReceiveKeyframes()
+     local framecount = net.ReadUInt(INT_BITCOUNT)
+     for i = 1, framecount do
+         local ID, entity, Frame, ModCount = net.ReadUInt(INT_BITCOUNT), net.ReadEntity(), net.ReadUInt(INT_BITCOUNT), net.ReadUInt(INT_BITCOUNT)
+-        local Modifiers, In, Out = {}, {}, {}
++        local Modifiers, In, Out, Curve = {}, {}, {}, {}
+         for j = 1, ModCount do
+             local name = net.ReadString()
+             Modifiers[name] = true
+             In[name] = net.ReadFloat()
+             Out[name] = net.ReadFloat()
++            local curve = net.ReadString()
++            Curve[name] = curve ~= "" and curve or nil
+         end
+-        SMH.TableSplit.AKeyframes(ID, entity, Frame, In, Out, Modifiers)
++        SMH.TableSplit.AKeyframes(ID, entity, Frame, In, Out, Modifiers, Curve)
+     end
+     return SMH.TableSplit.GetKeyframes()
+ end
+@@ -105,6 +107,8 @@ function CTRL.UpdateKeyframe(keyframeId, updateData, singledata)
+                     net.WriteString(data)
+                     if data == "Frame" then
+                         net.WriteUInt(value, INT_BITCOUNT)
++                    elseif data == "Curve" then
++                        net.WriteString(value)
+                     else
+                         net.WriteFloat(value)
+                     end
+@@ -114,6 +118,8 @@ function CTRL.UpdateKeyframe(keyframeId, updateData, singledata)
+                     net.WriteString(data)
+                     if data == "Frame" then
+                         net.WriteUInt(value, INT_BITCOUNT)
++                    elseif data == "Curve" then
++                        net.WriteString(value)
+                     else
+                         net.WriteFloat(value)
+                     end
+diff --git a/lua/smh/client/derma/curve_editor.lua b/lua/smh/client/derma/curve_editor.lua
+new file mode 100644
+index 0000000..343e2e8
+--- /dev/null
++++ b/lua/smh/client/derma/curve_editor.lua
+@@ -0,0 +1,295 @@
++-- Graph editor for keyframe curves (see shared/curves.lua).
++-- Edits the curve that leads from the selected keyframe to the next one.
++
++local PANEL = {}
++
++local GRAPH_W, GRAPH_H = 280, 200
++local MARGIN = 16
++local Y_MIN, Y_MAX = -0.75, 1.75
++local SAMPLES = 64
++local GRAB_RADIUS = 14
++local HANDLE_RADIUS = 6
++
++local COL_BG = Color(32, 32, 32)
++local COL_GRID = Color(55, 55, 55)
++local COL_GRID_MAIN = Color(95, 95, 95)
++local COL_CURVE = Color(90, 200, 255)
++local COL_CURVE_DIM = Color(110, 110, 110)
++local COL_HANDLE_1 = Color(255, 210, 60)
++local COL_HANDLE_2 = Color(90, 230, 120)
++local COL_TEXT = Color(190, 190, 190)
++
++local LEGACY_LABEL = "Legacy (Ease in / out)"
++local CUSTOM_LABEL = "Custom bezier"
++
++local function DefaultBezier()
++    return { 0.25, 0.1, 0.25, 1 }
++end
++
++function PANEL:Init()
++
++    self:SetTitle("SMH Curve")
++    self:SetDeleteOnClose(false)
++    self:SetSize(300, 316)
++
++    self.Curve = ""
++    self.Bezier = DefaultBezier()
++    self._active = false
++    self._loading = false
++    self._drag = nil
++
++    self.Info = vgui.Create("DLabel", self)
++    self.Info:SetText("From the selected keyframe to the next one")
++    self.Info:SizeToContents()
++
++    self.Preset = vgui.Create("DComboBox", self)
++    self.Preset:SetSortItems(false)
++    self.Preset:AddChoice(LEGACY_LABEL, "")
++    self.Preset:AddChoice(CUSTOM_LABEL, "custom")
++    for _, preset in ipairs(SMH.Curves.Presets) do
++        self.Preset:AddChoice(preset[1], preset[2])
++    end
++    self.Preset.OnSelect = function(_, _, _, data)
++        if self._loading then return end
++        self:SelectPreset(data)
++    end
++
++    self.Graph = vgui.Create("DPanel", self)
++    self.Graph.Paint = function(graph, w, h) self:PaintGraph(w, h) end
++    self.Graph.OnMousePressed = function(graph, mouseCode) self:GraphPressed(mouseCode) end
++    self.Graph.OnCursorMoved = function(graph, x, y) self:GraphMoved(x, y) end
++    self.Graph.OnMouseReleased = function(graph, mouseCode) self:GraphReleased(mouseCode) end
++
++    self.Entry = vgui.Create("DTextEntry", self)
++    self.Entry:SetUpdateOnType(false)
++    self.Entry.OnEnter = function() self:ApplyEntryText() end
++
++    self:SetActive(false)
++    self:SetCurveInternal("")
++
++end
++
++function PANEL:PerformLayout(width, height)
++
++    self.BaseClass.PerformLayout(self, width, height)
++
++    self.Info:SetPos(10, 28)
++    self.Preset:SetPos(10, 46)
++    self.Preset:SetSize(width - 20, 22)
++    self.Graph:SetPos(10, 74)
++    self.Graph:SetSize(GRAPH_W, GRAPH_H)
++    self.Entry:SetPos(10, 74 + GRAPH_H + 8)
++    self.Entry:SetSize(width - 20, 22)
++
++end
++
++-- graph space (x 0-1, y Y_MIN..Y_MAX) <-> panel pixels
++local function ToPixels(x, y)
++    local px = MARGIN + x * (GRAPH_W - MARGIN * 2)
++    local py = MARGIN + (1 - (y - Y_MIN) / (Y_MAX - Y_MIN)) * (GRAPH_H - MARGIN * 2)
++    return px, py
++end
++
++local function FromPixels(px, py)
++    local x = (px - MARGIN) / (GRAPH_W - MARGIN * 2)
++    local y = Y_MIN + (1 - (py - MARGIN) / (GRAPH_H - MARGIN * 2)) * (Y_MAX - Y_MIN)
++    return x, y
++end
++
++function PANEL:IsBezier()
++    local parsed = SMH.Curves.Parse(self.Curve)
++    return parsed ~= nil and parsed.Type == "bezier"
++end
++
++function PANEL:HandlePixels(index)
++    if index == 1 then
++        return ToPixels(self.Bezier[1], self.Bezier[2])
++    end
++    return ToPixels(self.Bezier[3], self.Bezier[4])
++end
++
++function PANEL:PaintGraph(w, h)
++
++    surface.SetDrawColor(COL_BG)
++    surface.DrawRect(0, 0, w, h)
++
++    for i = 0, 4 do
++        local gx = ToPixels(i / 4, 0)
++        surface.SetDrawColor((i == 0 or i == 4) and COL_GRID_MAIN or COL_GRID)
++        surface.DrawLine(gx, 0, gx, h)
++    end
++    for _, gy in ipairs({ -0.5, 0, 0.5, 1, 1.5 }) do
++        local _, py = ToPixels(0, gy)
++        surface.SetDrawColor((gy == 0 or gy == 1) and COL_GRID_MAIN or COL_GRID)
++        surface.DrawLine(0, py, w, py)
++    end
++
++    local legacy = SMH.Curves.Parse(self.Curve) == nil
++    surface.SetDrawColor(legacy and COL_CURVE_DIM or COL_CURVE)
++    local lastX, lastY
++    for i = 0, SAMPLES do
++        local t = i / SAMPLES
++        local value = SMH.Curves.Eval(self.Curve, t) or t
++        local px, py = ToPixels(t, value)
++        if lastX then surface.DrawLine(lastX, lastY, px, py) end
++        lastX, lastY = px, py
++    end
++
++    if self:IsBezier() then
++        local x0, y0 = ToPixels(0, 0)
++        local x1, y1 = ToPixels(1, 1)
++        local h1x, h1y = self:HandlePixels(1)
++        local h2x, h2y = self:HandlePixels(2)
++
++        surface.SetDrawColor(COL_HANDLE_1)
++        surface.DrawLine(x0, y0, h1x, h1y)
++        surface.SetDrawColor(COL_HANDLE_2)
++        surface.DrawLine(x1, y1, h2x, h2y)
++
++        draw.RoundedBox(HANDLE_RADIUS, h1x - HANDLE_RADIUS, h1y - HANDLE_RADIUS, HANDLE_RADIUS * 2, HANDLE_RADIUS * 2, COL_HANDLE_1)
++        draw.RoundedBox(HANDLE_RADIUS, h2x - HANDLE_RADIUS, h2y - HANDLE_RADIUS, HANDLE_RADIUS * 2, HANDLE_RADIUS * 2, COL_HANDLE_2)
++    elseif legacy then
++        draw.SimpleText("Using the Ease in / out numbers.", "DermaDefault", 8, 6, COL_TEXT)
++        draw.SimpleText("Pick a preset to use a curve instead.", "DermaDefault", 8, 20, COL_TEXT)
++    else
++        draw.SimpleText("Pick \"" .. CUSTOM_LABEL .. "\" to edit handles.", "DermaDefault", 8, 6, COL_TEXT)
++    end
++
++    if not self._active then
++        surface.SetDrawColor(0, 0, 0, 170)
++        surface.DrawRect(0, 0, w, h)
++        draw.SimpleText("Move to a keyframe to edit its curve", "DermaDefault", w / 2, h / 2, COL_TEXT, TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
++    end
++
++end
++
++function PANEL:GraphPressed(mouseCode)
++    if mouseCode ~= MOUSE_LEFT or not self._active or not self:IsBezier() then return end
++
++    local mx, my = self.Graph:CursorPos()
++    local best, bestDist = nil, GRAB_RADIUS * GRAB_RADIUS
++    for index = 1, 2 do
++        local hx, hy = self:HandlePixels(index)
++        local dist = (mx - hx) ^ 2 + (my - hy) ^ 2
++        if dist < bestDist then
++            best, bestDist = index, dist
++        end
++    end
++
++    if best then
++        self._drag = best
++        self.Graph:MouseCapture(true)
++    end
++end
++
++function PANEL:GraphMoved(mx, my)
++    if not self._drag then return end
++
++    local x, y = FromPixels(mx, my)
++    if input.IsShiftDown() then
++        x, y = math.Round(x * 20) / 20, math.Round(y * 20) / 20
++    end
++    x = math.Clamp(x, 0, 1)
++    y = math.Clamp(y, Y_MIN, Y_MAX)
++
++    if self._drag == 1 then
++        self.Bezier[1], self.Bezier[2] = x, y
++    else
++        self.Bezier[3], self.Bezier[4] = x, y
++    end
++
++    self.Curve = SMH.Curves.MakeBezier(unpack(self.Bezier))
++    self:RefreshControls()
++end
++
++function PANEL:GraphReleased(mouseCode)
++    if not self._drag then return end
++
++    self._drag = nil
++    self.Graph:MouseCapture(false)
++    self:Commit()
++end
++
++function PANEL:SelectPreset(data)
++    if data == "custom" then
++        data = SMH.Curves.MakeBezier(unpack(self.Bezier))
++    end
++    self:SetCurveInternal(data)
++    self:Commit()
++end
++
++function PANEL:ApplyEntryText()
++    local numbers = {}
++    for n in string.gmatch(self.Entry:GetValue(), "%-?%d*%.?%d+") do
++        numbers[#numbers + 1] = tonumber(n)
++    end
++
++    if #numbers >= 4 then
++        local curve = SMH.Curves.MakeBezier(
++            math.Clamp(numbers[1], 0, 1), math.Clamp(numbers[2], Y_MIN, Y_MAX),
++            math.Clamp(numbers[3], 0, 1), math.Clamp(numbers[4], Y_MIN, Y_MAX)
++        )
++        self:SetCurveInternal(curve)
++        self:Commit()
++    else
++        self:RefreshControls() -- bad input, put the real value back
++    end
++end
++
++-- Updates the stored curve and every control, without sending anything.
++function PANEL:SetCurveInternal(curve)
++    self.Curve = curve or ""
++
++    local parsed = SMH.Curves.Parse(self.Curve)
++    if parsed and parsed.Type == "bezier" then
++        self.Bezier = { parsed[1], parsed[2], parsed[3], parsed[4] }
++    end
++
++    self:RefreshControls()
++end
++
++function PANEL:RefreshControls()
++    local wasLoading = self._loading
++    self._loading = true
++
++    local label = (self.Curve == "") and LEGACY_LABEL or nil
++    for _, preset in ipairs(SMH.Curves.Presets) do
++        if preset[2] == self.Curve then label = preset[1] end
++    end
++    self.Preset:SetValue(label or CUSTOM_LABEL)
++
++    if self:IsBezier() then
++        self.Entry:SetText(string.format("%s, %s, %s, %s",
++            tostring(math.Round(self.Bezier[1], 3)), tostring(math.Round(self.Bezier[2], 3)),
++            tostring(math.Round(self.Bezier[3], 3)), tostring(math.Round(self.Bezier[4], 3))))
++    else
++        self.Entry:SetText("")
++    end
++
++    self._loading = wasLoading
++end
++
++function PANEL:Commit()
++    if self._loading or not self._active then return end
++    self:OnCurveChanged(self.Curve)
++end
++
++-- Called when the selected keyframe changes (or its data arrives from the server).
++function PANEL:SetCurve(curve)
++    if self._drag then return end -- don't yank the handle out of the user's hand
++
++    self._loading = true
++    self:SetActive(true)
++    self:SetCurveInternal(curve)
++    self._loading = false
++end
++
++function PANEL:SetActive(active)
++    self._active = active and true or false
++    self.Preset:SetEnabled(self._active)
++    self.Entry:SetEnabled(self._active)
++end
++
++function PANEL:OnCurveChanged(curve) end
++
++vgui.Register("SMHCurveEditor", PANEL, "DFrame")
+diff --git a/lua/smh/client/derma/smh_menu.lua b/lua/smh/client/derma/smh_menu.lua
+index 38a601a..4083d42 100644
+--- a/lua/smh/client/derma/smh_menu.lua
++++ b/lua/smh/client/derma/smh_menu.lua
+@@ -68,6 +68,10 @@ function PANEL:Init()
+     self.EaseOutControl.Label:SetText("Ease out")
+     self.EaseOutControl.Label:SizeToContents()
+ 
++    self.CurveButton = vgui.Create("DButton", self.Easing)
++    self.CurveButton:SetText("Curve")
++    self.CurveButton.DoClick = function() self:OnRequestToggleCurveEditor() end
++
+     self.RecordButton = vgui.Create("DButton", self)
+     self.RecordButton:SetText("Record")
+     self.RecordButton.DoClick = function() self:OnRequestRecord() end
+@@ -119,7 +123,7 @@ function PANEL:PerformLayout(width, height)
+     self.PlaybackLengthControl.Label:SetRelativePos(self.PlaybackLengthControl, -(sizeX) - 5, 3)
+ 
+     self.Easing:SetPos(540, 0)
+-    self.Easing:SetSize(250, 30)
++    self.Easing:SetSize(330, 30)
+ 
+     self.EaseInControl:SetPos(60, 2)
+     self.EaseInControl:SetSize(50, 20)
+@@ -131,6 +135,9 @@ function PANEL:PerformLayout(width, height)
+     sizeX, sizeY = self.EaseOutControl.Label:GetSize()
+     self.EaseOutControl.Label:SetRelativePos(self.EaseOutControl, -(sizeX) - 5, 3)
+ 
++    self.CurveButton:SetPos(225, 2)
++    self.CurveButton:SetSize(60, 20)
++
+     self.RecordButton:SetPos(width - 60 * 5 - 5 * 5, 2)
+     self.RecordButton:SetSize(60, 20)
+ 
+@@ -202,18 +209,24 @@ function PANEL:UpdatePositionLabel(frame, totalFrames)
+     self.PositionLabel:SizeToContents()
+ end
+ 
+-function PANEL:ShowEasingControls(easeIn, easeOut)
++function PANEL:ShowEasingControls(easeIn, easeOut, curve)
+     self._sendKeyframeChanges = false
+     self.EaseInControl:SetValue(easeIn)
+     self.EaseOutControl:SetValue(easeOut)
+     self.Easing:SetVisible(true)
+     self._sendKeyframeChanges = true
++    self:OnEasingShown(curve)
+ end
+ 
+ function PANEL:HideEasingControls()
+     self.Easing:SetVisible(false)
++    self:OnEasingHidden()
+ end
+ 
++function PANEL:OnEasingShown(curve) end
++function PANEL:OnEasingHidden() end
++function PANEL:OnRequestToggleCurveEditor() end
++
+ function PANEL:OnRequestStateUpdate(newState) end
+ function PANEL:OnRequestKeyframeUpdate(newKeyframeData) end
+ function PANEL:OnRequestOpenPropertiesMenu() end
+diff --git a/lua/smh/client/ui.lua b/lua/smh/client/ui.lua
+index dfce636..587b1e9 100644
+--- a/lua/smh/client/ui.lua
++++ b/lua/smh/client/ui.lua
+@@ -268,6 +268,18 @@ local function AddCallbacks()
+         LoadMenu:SetVisible(true)
+         SMH.Controller.GetServerSaves()
+     end
++    WorldClicker.MainMenu.OnRequestToggleCurveEditor = function()
++        WorldClicker.CurveEditor:SetVisible(not WorldClicker.CurveEditor:IsVisible())
++    end
++    WorldClicker.MainMenu.OnEasingShown = function(_, curve)
++        WorldClicker.CurveEditor:SetCurve(curve)
++    end
++    WorldClicker.MainMenu.OnEasingHidden = function()
++        WorldClicker.CurveEditor:SetActive(false)
++    end
++    WorldClicker.CurveEditor.OnCurveChanged = function(_, curve)
++        WorldClicker.MainMenu:OnRequestKeyframeUpdate({ Curve = curve })
++    end
+     WorldClicker.MainMenu.OnRequestOpenSettings = function()
+         WorldClicker.Settings:ApplySettings(SMH.Settings.GetAll())
+         WorldClicker.Settings:SetVisible(true)
+@@ -426,6 +438,10 @@ hook.Add("InitPostEntity", "SMHMenuSetup", function()
+     WorldClicker.Settings:SetPos(ScrW() - 250, ScrH() - 90 - 290)
+     WorldClicker.Settings:SetVisible(false)
+ 
++    WorldClicker.CurveEditor = vgui.Create("SMHCurveEditor", WorldClicker)
++    WorldClicker.CurveEditor:SetPos(ScrW() - 250 - 310, ScrH() - 90 - 330)
++    WorldClicker.CurveEditor:SetVisible(false)
++
+     WorldClicker.PhysRecorder = vgui.Create("SMHPhysRecord", WorldClicker)
+     WorldClicker.PhysRecorder:SetPos(ScrW() - 250 - 250, ScrH() - 90 - 170)
+     WorldClicker.PhysRecorder:SetVisible(false)
+@@ -480,7 +496,7 @@ function MGR.SetFrame(frame)
+         if FrameToKeyframe[frame] ~= nil then
+             local data = KeyframeEasingData[FrameToKeyframe[frame]]
+             if data then
+-                WorldClicker.MainMenu:ShowEasingControls(data.EaseIn, data.EaseOut)
++                WorldClicker.MainMenu:ShowEasingControls(data.EaseIn, data.EaseOut, data.Curve)
+             else
+                 WorldClicker.MainMenu:ShowEasingControls(0, 0)
+             end
+@@ -528,6 +544,7 @@ function MGR.SetKeyframes(keyframes, isreceiving)
+                         KeyframeEasingData[LocalIDs] = {
+                             EaseIn = keyframe.EaseIn[name],
+                             EaseOut = keyframe.EaseOut[name],
++                            Curve = keyframe.Curve and keyframe.Curve[name],
+                         }
+                         KeyframeIDs[keyframe.ID] = LocalIDs
+                         LocalIDs = LocalIDs + 1
+@@ -544,7 +561,7 @@ function MGR.SetKeyframes(keyframes, isreceiving)
+         if FrameToKeyframe[SMH.State.Frame] ~= nil then
+             local data = KeyframeEasingData[FrameToKeyframe[SMH.State.Frame]]
+             if data then
+-                WorldClicker.MainMenu:ShowEasingControls(data.EaseIn, data.EaseOut)
++                WorldClicker.MainMenu:ShowEasingControls(data.EaseIn, data.EaseOut, data.Curve)
+             else
+                 WorldClicker.MainMenu:ShowEasingControls(0, 0)
+             end
+@@ -562,6 +579,7 @@ function MGR.SetKeyframes(keyframes, isreceiving)
+                 KeyframeEasingData[LocalIDs] = {
+                     EaseIn = keyframe.EaseIn["world"],
+                     EaseOut = keyframe.EaseOut["world"],
++                    Curve = keyframe.Curve and keyframe.Curve["world"],
+                 }
+                 KeyframeIDs[keyframe.ID] = LocalIDs
+                 LocalIDs = LocalIDs + 1
+@@ -598,6 +616,7 @@ function MGR.UpdateKeyframe(keyframe)
+     KeyframeEasingData[KeyframeIDs[keyframe.ID]] = {
+         EaseIn = keyframe.EaseIn[name],
+         EaseOut = keyframe.EaseOut[name],
++        Curve = keyframe.Curve and keyframe.Curve[name],
+     }
+ 
+     KeyframePointers[KeyframeIDs[keyframe.ID]]:SetFrame(keyframe.Frame)
+@@ -610,7 +629,7 @@ function MGR.UpdateKeyframe(keyframe)
+     end
+     FrameToKeyframe[keyframe.Frame] = KeyframeIDs[keyframe.ID]
+     if keyframe.Frame == SMH.State.Frame then
+-        WorldClicker.MainMenu:ShowEasingControls(keyframe.EaseIn[name], keyframe.EaseOut[name])
++        WorldClicker.MainMenu:ShowEasingControls(keyframe.EaseIn[name], keyframe.EaseOut[name], keyframe.Curve and keyframe.Curve[name])
+     end
+ end
+ 
+diff --git a/lua/smh/server/controller.lua b/lua/smh/server/controller.lua
+index 627057a..1e6d229 100644
+--- a/lua/smh/server/controller.lua
++++ b/lua/smh/server/controller.lua
+@@ -1,7 +1,7 @@
+ local INT_BITCOUNT = 32
+ local KFRAMES_PER_MSG = 250
+ 
+-local function SendKeyframes(framecount, IDs, ents, Frame, In, Out, ModCount, Modifiers, loop)
++local function SendKeyframes(framecount, IDs, ents, Frame, In, Out, ModCount, Modifiers, Curve, loop)
+     if not loop then loop = 0 end
+ 
+     local sendframes = framecount > KFRAMES_PER_MSG and KFRAMES_PER_MSG or framecount
+@@ -16,6 +16,7 @@ local function SendKeyframes(framecount, IDs, ents, Frame, In, Out, ModCount, Mo
+             net.WriteString(Modifiers[i][j])
+             net.WriteFloat(In[i][j])
+             net.WriteFloat(Out[i][j])
++            net.WriteString(Curve[i][j])
+         end
+     end
+     return framecount - KFRAMES_PER_MSG
+@@ -43,13 +44,13 @@ local function ReceiveProperties()
+     return SMH.TableSplit.GetProperties()
+ end
+ 
+-local function SendLeftoverKeyframes(player, framecount, IDs, entities, Frame, In, Out, ModCount, Modifiers)
++local function SendLeftoverKeyframes(player, framecount, IDs, entities, Frame, In, Out, ModCount, Modifiers, Curve)
+     if framecount < 0 then return end
+ 
+     for i = 1, math.ceil(framecount / KFRAMES_PER_MSG) do
+         if framecount < 0 then break end
+         net.Start(SMH.MessageTypes.GetAllKeyframes)
+-            framecount = SendKeyframes(framecount, IDs, entities, Frame, In, Out, ModCount, Modifiers, i)
++            framecount = SendKeyframes(framecount, IDs, entities, Frame, In, Out, ModCount, Modifiers, Curve, i)
+         net.Send(player)
+     end
+ end
+@@ -107,17 +108,17 @@ local function SelectEntity(msgLength, player)
+     end
+ 
+     local keyframes = SMH.KeyframeManager.GetAllForEntity(player, entities)
+-    local framecount, IDs, ents, Frame, In, Out, KModCount, KModifiers = SMH.TableSplit.DKeyframes(keyframes)
++    local framecount, IDs, ents, Frame, In, Out, KModCount, KModifiers, Curve = SMH.TableSplit.DKeyframes(keyframes)
+ 
+     net.Start(SMH.MessageTypes.SelectEntityResponse)
+-    framecount = SendKeyframes(framecount, IDs, ents, Frame, In, Out, KModCount, KModifiers)
++    framecount = SendKeyframes(framecount, IDs, ents, Frame, In, Out, KModCount, KModifiers, Curve)
+     net.WriteUInt(#entities, INT_BITCOUNT)
+     for _, entity in ipairs(entities) do
+         net.WriteEntity(entity)
+     end
+     net.Send(player)
+ 
+-    SendLeftoverKeyframes(player, framecount, IDs, ents, Frame, In, Out, KModCount, KModifiers)
++    SendLeftoverKeyframes(player, framecount, IDs, ents, Frame, In, Out, KModCount, KModifiers, Curve)
+ end
+ 
+ local function CreateKeyframe(msgLength, player)
+@@ -135,10 +136,10 @@ local function CreateKeyframe(msgLength, player)
+ 
+     local keyframes = SMH.KeyframeManager.Create(player, entities, frame, timeline)
+     if not next(keyframes) then return end
+-    local framecount, IDs, ents, Frame, In, Out, KModCount, KModifiers = SMH.TableSplit.DKeyframes(keyframes)
++    local framecount, IDs, ents, Frame, In, Out, KModCount, KModifiers, Curve = SMH.TableSplit.DKeyframes(keyframes)
+ 
+     net.Start(SMH.MessageTypes.UpdateKeyframeResponse)
+-    SendKeyframes(framecount, IDs, ents, Frame, In, Out, KModCount, KModifiers)
++    SendKeyframes(framecount, IDs, ents, Frame, In, Out, KModCount, KModifiers, Curve)
+     net.Send(player)
+ end
+ 
+@@ -157,6 +158,10 @@ local function UpdateKeyframe(msgLength, player)
+             local temptable = {}
+             temptable[data] = net.ReadUInt(INT_BITCOUNT)
+             table.insert(bufferData[player].UpdateData, temptable)
++        elseif data == "Curve" then
++            local temptable = {}
++            temptable[data] = net.ReadString()
++            table.insert(bufferData[player].UpdateData, temptable)
+         else
+             local temptable = {}
+             temptable[data] = net.ReadFloat()
+@@ -171,10 +176,10 @@ local function UpdateKeyframeExecute(msgLength, player)
+     local keyframes = SMH.KeyframeManager.Update(player, bufferData[player].Ids, bufferData[player].UpdateData, bufferData[player].Timeline)
+ 
+     for key, keyframe in ipairs(keyframes) do
+-        local framecount, IDs, ents, Frame, In, Out, KModCount, KModifiers = SMH.TableSplit.DKeyframes({keyframe})
++        local framecount, IDs, ents, Frame, In, Out, KModCount, KModifiers, Curve = SMH.TableSplit.DKeyframes({keyframe})
+ 
+         net.Start(SMH.MessageTypes.UpdateKeyframeResponse)
+-        SendKeyframes(framecount, IDs, ents, Frame, In, Out, KModCount, KModifiers)
++        SendKeyframes(framecount, IDs, ents, Frame, In, Out, KModCount, KModifiers, Curve)
+         net.Send(player)
+     end
+ 
+@@ -198,10 +203,10 @@ local function CopyKeyframeExecute(msgLength, player)
+     local keyframes = SMH.KeyframeManager.Copy(player, bufferData[player].Ids, bufferData[player].Frames, bufferData[player].Timeline)
+     
+     for key, keyframe in ipairs(keyframes) do
+-        local framecount, IDs, ents, Frame, In, Out, KModCount, KModifiers = SMH.TableSplit.DKeyframes({keyframe})
++        local framecount, IDs, ents, Frame, In, Out, KModCount, KModifiers, Curve = SMH.TableSplit.DKeyframes({keyframe})
+ 
+         net.Start(SMH.MessageTypes.UpdateKeyframeResponse)
+-        SendKeyframes(framecount, IDs, ents, Frame, In, Out, KModCount, KModifiers)
++        SendKeyframes(framecount, IDs, ents, Frame, In, Out, KModCount, KModifiers, Curve)
+         net.Send(player)
+     end
+ 
+@@ -303,14 +308,14 @@ local function Load(msgLength, player)
+     SMH.KeyframeManager.ImportSave(player, entity, serializedKeyframes, entityProperties)
+ 
+     local keyframes = SMH.KeyframeManager.GetAllForEntity(player, {entity})
+-    local framecount, IDs, ents, Frame, In, Out, KModCount, KModifiers = SMH.TableSplit.DKeyframes(keyframes)
++    local framecount, IDs, ents, Frame, In, Out, KModCount, KModifiers, Curve = SMH.TableSplit.DKeyframes(keyframes)
+ 
+     net.Start(SMH.MessageTypes.LoadResponse)
+-    framecount = SendKeyframes(framecount, IDs, ents, Frame, In, Out, KModCount, KModifiers)
++    framecount = SendKeyframes(framecount, IDs, ents, Frame, In, Out, KModCount, KModifiers, Curve)
+     net.WriteEntity(entity)
+     net.Send(player)
+ 
+-    SendLeftoverKeyframes(player, framecount, IDs, ents, Frame, In, Out, KModCount, KModifiers)
++    SendLeftoverKeyframes(player, framecount, IDs, ents, Frame, In, Out, KModCount, KModifiers, Curve)
+ end
+ 
+ local function GetModelInfo(msgLength, player)
+@@ -521,13 +526,13 @@ local function UpdateTimeline(msgLength, player)
+     end
+ 
+     local keyframes = SMH.KeyframeManager.GetAllForEntity(player, entities)
+-    local framecount, IDs, ents, Frame, In, Out, KModCount, KModifiers = SMH.TableSplit.DKeyframes(keyframes)
++    local framecount, IDs, ents, Frame, In, Out, KModCount, KModifiers, Curve = SMH.TableSplit.DKeyframes(keyframes)
+ 
+     net.Start(SMH.MessageTypes.UpdateTimelineResponse)
+-    framecount = SendKeyframes(framecount, IDs, ents, Frame, In, Out, KModCount, KModifiers)
++    framecount = SendKeyframes(framecount, IDs, ents, Frame, In, Out, KModCount, KModifiers, Curve)
+     net.Send(player)
+ 
+-    SendLeftoverKeyframes(player, framecount, IDs, ents, Frame, In, Out, KModCount, KModifiers)
++    SendLeftoverKeyframes(player, framecount, IDs, ents, Frame, In, Out, KModCount, KModifiers, Curve)
+ end
+ 
+ local function RequestModifiers(msgLength, player)
+diff --git a/lua/smh/server/keyframe_data.lua b/lua/smh/server/keyframe_data.lua
+index 4da7d65..49d8916 100644
+--- a/lua/smh/server/keyframe_data.lua
++++ b/lua/smh/server/keyframe_data.lua
+@@ -30,7 +30,7 @@ function SMH.GetClosestKeyframes(keyframes, frame, ignoreCurrentFrame, modname)
+     local lerpMultiplier = 0
+     if prevKeyframe.Frame ~= nextKeyframe.Frame then
+         lerpMultiplier = (frame - prevKeyframe.Frame) / (nextKeyframe.Frame - prevKeyframe.Frame)
+-        lerpMultiplier = math.EaseInOut(lerpMultiplier, prevKeyframe.EaseOut[modname], nextKeyframe.EaseIn[modname])
++        lerpMultiplier = SMH.ApplyEasing(prevKeyframe, nextKeyframe, modname, lerpMultiplier)
+     end
+ 
+     return prevKeyframe, nextKeyframe, lerpMultiplier
+@@ -46,6 +46,7 @@ function META:New(player, entity)
+         Frame = -1,
+         EaseIn = {},
+         EaseOut = {},
++        Curve = {},
+         Modifiers = {}
+     }
+     self.NextKeyframeId = self.NextKeyframeId + 1
+diff --git a/lua/smh/server/keyframe_manager.lua b/lua/smh/server/keyframe_manager.lua
+index f591367..501658f 100644
+--- a/lua/smh/server/keyframe_manager.lua
++++ b/lua/smh/server/keyframe_manager.lua
+@@ -39,6 +39,7 @@ local function ClearModifier(keyframe, modname)
+     keyframe.Modifiers[modname] = nil
+     keyframe.EaseIn[modname] = nil
+     keyframe.EaseOut[modname] = nil
++    keyframe.Curve[modname] = nil
+ end
+ 
+ hook.Add("EntityRemoved", "SMHKeyframesEntityRemoved", function(entity)
+@@ -147,16 +148,19 @@ function MGR.Update(player, keyframeIds, updateData, timeline)
+             "Frame",
+             "EaseIn",
+             "EaseOut",
++            "Curve",
+         }
+         for _, field in pairs(updateableFields) do
+             if updateData[id][field] then
+                 if field == "Frame" then
+                     if updateData[id][field] == keyframe.Frame then continue end
+                     local remainmods, EaseIn, EaseOut, frame = table.Copy(keyframe.Modifiers), table.Copy(keyframe.EaseIn), table.Copy(keyframe.EaseOut), updateData[id][field]
++                    local Curve = table.Copy(keyframe.Curve)
+                     for _, name in ipairs(modnames) do
+                         remainmods[name] = nil
+                         EaseIn[name] = nil
+                         EaseOut[name] = nil
++                        Curve[name] = nil
+                     end
+ 
+                     if next(remainmods) then -- if there are any modifiers remaining, then we create another keyframe that will stay there
+@@ -169,11 +173,18 @@ function MGR.Update(player, keyframeIds, updateData, timeline)
+                         remainkeyframe.Modifiers = remainmods
+                         remainkeyframe.EaseIn = EaseIn
+                         remainkeyframe.EaseOut = EaseOut
++                        remainkeyframe.Curve = Curve
+                     end
+ 
+                     movingkeyframes[keyframe] = frame
+                 else
+                     for _, name in ipairs(modnames) do
++                        if field == "Curve" then
++                            local curve = updateData[id][field]
++                            if not keyframe.Modifiers[name] or not SMH.Curves.IsValid(curve) then continue end
++                            keyframe.Curve[name] = curve ~= "" and curve or nil
++                            continue
++                        end
+                         if not keyframe[field][name] then continue end
+                         keyframe[field][name] = updateData[id][field]
+                     end
+@@ -193,6 +204,7 @@ function MGR.Update(player, keyframeIds, updateData, timeline)
+                     keyframe.Modifiers[name] = data
+                     keyframe.EaseIn[name] = replacekey.EaseIn[name]
+                     keyframe.EaseOut[name] = replacekey.EaseOut[name]
++                    keyframe.Curve[name] = replacekey.Curve[name]
+                 end
+             end
+             SMH.KeyframeData:Delete(player, replacekey.ID)
+@@ -215,11 +227,12 @@ function MGR.Copy(player, keyframeIds, frame, timeline)
+         local keyframe = SMH.KeyframeData.Players[player].Keyframes[keyframeId]
+         local modnames = player == keyframe.Entity and {"world"} or SMH.Properties.Players[player].TimelineSetting.TimelineMods[timeline]
+ 
+-        local EaseIn, EaseOut, Mods = {}, {}, {}
++        local EaseIn, EaseOut, Curve, Mods = {}, {}, {}, {}
+         for _, name in ipairs(modnames) do
+             if not keyframe.Modifiers[name] then continue end
+             EaseIn[name] = keyframe.EaseIn[name]
+             EaseOut[name] = keyframe.EaseOut[name]
++            Curve[name] = keyframe.Curve[name]
+             if istable(keyframe.Modifiers[name]) then
+                 Mods[name] = table.Copy(keyframe.Modifiers[name]) -- in case if we copy things like world keyframes
+             else
+@@ -230,6 +243,7 @@ function MGR.Copy(player, keyframeIds, frame, timeline)
+         local copiedKeyframe = SMH.KeyframeData:New(player, keyframe.Entity)
+         copiedKeyframe.EaseIn = EaseIn
+         copiedKeyframe.EaseOut = EaseOut
++        copiedKeyframe.Curve = Curve
+         copiedKeyframe.Modifiers = Mods
+ 
+         movingkeyframes[copiedKeyframe] = frame[id]
+@@ -244,6 +258,7 @@ function MGR.Copy(player, keyframeIds, frame, timeline)
+                     keyframe.Modifiers[name] = data
+                     keyframe.EaseIn[name] = replacekey.EaseIn[name]
+                     keyframe.EaseOut[name] = replacekey.EaseOut[name]
++                    keyframe.Curve[name] = replacekey.Curve[name]
+                 end
+             end
+             SMH.KeyframeData:Delete(player, replacekey.ID)
+@@ -293,6 +308,7 @@ function MGR.ImportSave(player, entity, serializedKeyframes, entityProperties)
+             for name, _ in pairs(skf.EntityData) do
+                 keyframe.EaseIn[name] = type(skf.EaseIn) == "table" and skf.EaseIn[name] or skf.EaseIn
+                 keyframe.EaseOut[name] = type(skf.EaseOut) == "table" and skf.EaseOut[name] or skf.EaseOut
++                keyframe.Curve[name] = type(skf.Curve) == "table" and skf.Curve[name] or nil
+                 keyframe.Modifiers[name] = skf.EntityData[name]
+             end
+         else
+@@ -301,6 +317,7 @@ function MGR.ImportSave(player, entity, serializedKeyframes, entityProperties)
+             for name, _ in pairs(skf.EntityData) do
+                 keyframe.EaseIn[name] = type(skf.EaseIn) == "table" and skf.EaseIn[name] or skf.EaseIn
+                 keyframe.EaseOut[name] = type(skf.EaseOut) == "table" and skf.EaseOut[name] or skf.EaseOut
++                keyframe.Curve[name] = type(skf.Curve) == "table" and skf.Curve[name] or nil
+                 keyframe.Modifiers[name] = skf.EntityData[name]
+             end
+         end
+diff --git a/lua/smh/server/playback_manager.lua b/lua/smh/server/playback_manager.lua
+index ba6a43b..8639451 100644
+--- a/lua/smh/server/playback_manager.lua
++++ b/lua/smh/server/playback_manager.lua
+@@ -30,7 +30,7 @@ local function PlaybackSmooth(player, playback, settings)
+                     end
+                 else
+                     local lerpMultiplier = ((playback.Timer + playback.StartFrame * timePerFrame) - prevKeyframe.Frame * timePerFrame) / ((nextKeyframe.Frame - prevKeyframe.Frame) * timePerFrame)
+-                    lerpMultiplier = math.EaseInOut(lerpMultiplier, prevKeyframe.EaseOut[name], nextKeyframe.EaseIn[name])
++                    lerpMultiplier = SMH.ApplyEasing(prevKeyframe, nextKeyframe, name, lerpMultiplier)
+ 
+                     if prevKeyframe.Modifiers[name] and nextKeyframe.Modifiers[name] then
+                         mod:LoadBetween(entity, prevKeyframe.Modifiers[name], nextKeyframe.Modifiers[name], lerpMultiplier, settings);
+diff --git a/lua/smh/shared.lua b/lua/smh/shared.lua
+index bd2d06c..5cbf944 100644
+--- a/lua/smh/shared.lua
++++ b/lua/smh/shared.lua
+@@ -93,5 +93,6 @@ end
+ cleanup.Register("smhentity")
+ CreateConVar("sbox_maxsmhentity", 20, FCVAR_NOTIFY)
+ 
++include("shared/curves.lua")
+ include("shared/saves.lua")
+ include("shared/tablesplit.lua")
+diff --git a/lua/smh/shared/curves.lua b/lua/smh/shared/curves.lua
+new file mode 100644
+index 0000000..ca2b33b
+--- /dev/null
++++ b/lua/smh/shared/curves.lua
+@@ -0,0 +1,172 @@
++-- Keyframe curves (graph / bezier easing).
++--
++-- A curve is stored per keyframe, per modifier, as a short string. It describes
++-- how values travel from THAT keyframe to the NEXT one (like Blender / After Effects):
++--   nil or ""             legacy: use the old EaseIn / EaseOut numbers
++--   "const"               hold this keyframe's value until the next keyframe
++--   "bounce", "elastic"   out-bounce / out-elastic (can't be drawn as a single bezier)
++--   "bezier:x1,y1,x2,y2"  CSS-style cubic bezier. x1/x2 are 0-1, y1/y2 may overshoot
++
++SMH.Curves = SMH.Curves or {}
++local MGR = SMH.Curves
++
++MGR.MaxLength = 64
++MGR.DefaultBezier = "bezier:0.25,0.1,0.25,1"
++
++-- { label, curve }. Bezier values are the common easings.net / CSS set.
++MGR.Presets = {
++    { "Linear",           "bezier:0,0,1,1" },
++    { "Hold (no tween)",  "const" },
++    { "Ease (CSS)",       "bezier:0.25,0.1,0.25,1" },
++
++    { "In Sine",          "bezier:0.47,0,0.745,0.715" },
++    { "Out Sine",         "bezier:0.39,0.575,0.565,1" },
++    { "In Out Sine",      "bezier:0.445,0.05,0.55,0.95" },
++
++    { "In Quad",          "bezier:0.55,0.085,0.68,0.53" },
++    { "Out Quad",         "bezier:0.25,0.46,0.45,0.94" },
++    { "In Out Quad",      "bezier:0.455,0.03,0.515,0.955" },
++
++    { "In Cubic",         "bezier:0.55,0.055,0.675,0.19" },
++    { "Out Cubic",        "bezier:0.215,0.61,0.355,1" },
++    { "In Out Cubic",     "bezier:0.645,0.045,0.355,1" },
++
++    { "In Quart",         "bezier:0.895,0.03,0.685,0.22" },
++    { "Out Quart",        "bezier:0.165,0.84,0.44,1" },
++    { "In Out Quart",     "bezier:0.77,0,0.175,1" },
++
++    { "In Quint",         "bezier:0.755,0.05,0.855,0.06" },
++    { "Out Quint",        "bezier:0.23,1,0.32,1" },
++    { "In Out Quint",     "bezier:0.86,0,0.07,1" },
++
++    { "In Expo",          "bezier:0.95,0.05,0.795,0.035" },
++    { "Out Expo",         "bezier:0.19,1,0.22,1" },
++    { "In Out Expo",      "bezier:1,0,0,1" },
++
++    { "In Circ",          "bezier:0.6,0.04,0.98,0.335" },
++    { "Out Circ",         "bezier:0.075,0.82,0.165,1" },
++    { "In Out Circ",      "bezier:0.785,0.135,0.15,0.86" },
++
++    { "In Back",          "bezier:0.6,-0.28,0.735,0.045" },
++    { "Out Back",         "bezier:0.175,0.885,0.32,1.275" },
++    { "In Out Back",      "bezier:0.68,-0.55,0.265,1.55" },
++
++    { "Out Bounce",       "bounce" },
++    { "Out Elastic",      "elastic" },
++}
++
++local function OutBounce(t)
++    local n1, d1 = 7.5625, 2.75
++    if t < 1 / d1 then
++        return n1 * t * t
++    elseif t < 2 / d1 then
++        t = t - 1.5 / d1
++        return n1 * t * t + 0.75
++    elseif t < 2.5 / d1 then
++        t = t - 2.25 / d1
++        return n1 * t * t + 0.9375
++    end
++    t = t - 2.625 / d1
++    return n1 * t * t + 0.984375
++end
++
++local function OutElastic(t)
++    if t <= 0 then return 0 end
++    if t >= 1 then return 1 end
++    return 2 ^ (-10 * t) * math.sin((t * 10 - 0.75) * (2 * math.pi) / 3) + 1
++end
++
++-- Solves x(s) = t for the bezier parameter s, then returns y(s).
++local function EvalBezier(x1, y1, x2, y2, t)
++    if t <= 0 then return 0 end
++    if t >= 1 then return 1 end
++
++    local s = t
++    for _ = 1, 6 do -- newton
++        local u = 1 - s
++        local err = 3 * u * u * s * x1 + 3 * u * s * s * x2 + s * s * s - t
++        if math.abs(err) < 1e-6 then break end
++        local d = 3 * u * u * x1 + 6 * u * s * (x2 - x1) + 3 * s * s * (1 - x2)
++        if math.abs(d) < 1e-6 then break end
++        s = s - err / d
++    end
++
++    local u = 1 - s
++    if s < 0 or s > 1 or math.abs(3 * u * u * s * x1 + 3 * u * s * s * x2 + s * s * s - t) > 1e-4 then
++        local lo, hi = 0, 1 -- bisection fallback (x is monotonic because x1, x2 are in 0-1)
++        for _ = 1, 30 do
++            s = (lo + hi) / 2
++            u = 1 - s
++            local x = 3 * u * u * s * x1 + 3 * u * s * s * x2 + s * s * s
++            if x < t then lo = s else hi = s end
++        end
++        u = 1 - s
++    end
++
++    return 3 * u * u * s * y1 + 3 * u * s * s * y2 + s * s * s
++end
++
++local cache = {}
++
++-- Returns a parsed curve table, or nil if the string is empty / invalid (= legacy).
++function MGR.Parse(str)
++    if type(str) ~= "string" or str == "" or #str > MGR.MaxLength then return nil end
++
++    local cached = cache[str]
++    if cached ~= nil then return cached or nil end
++
++    local parsed = false
++    if str == "const" or str == "bounce" or str == "elastic" then
++        parsed = { Type = str }
++    else
++        local a, b, c, d = string.match(str, "^bezier:([%-%d%.]+),([%-%d%.]+),([%-%d%.]+),([%-%d%.]+)$")
++        a, b, c, d = tonumber(a), tonumber(b), tonumber(c), tonumber(d)
++        if a and b and c and d then
++            parsed = {
++                Type = "bezier",
++                math.Clamp(a, 0, 1), b, math.Clamp(c, 0, 1), d,
++            }
++        end
++    end
++
++    cache[str] = parsed
++    return parsed or nil
++end
++
++function MGR.IsValid(str)
++    return str == "" or MGR.Parse(str) ~= nil
++end
++
++-- Builds a bezier curve string from 4 numbers (rounded so strings stay short).
++function MGR.MakeBezier(x1, y1, x2, y2)
++    local function f(v) return tostring(math.Round(v, 3)) end
++    return "bezier:" .. f(x1) .. "," .. f(y1) .. "," .. f(x2) .. "," .. f(y2)
++end
++
++-- Eases t (0-1). Returns nil for legacy / invalid curves so callers can fall back.
++function MGR.Eval(str, t)
++    local curve = MGR.Parse(str)
++    if not curve then return nil end
++
++    t = math.Clamp(t, 0, 1)
++    if curve.Type == "bezier" then
++        return EvalBezier(curve[1], curve[2], curve[3], curve[4], t)
++    elseif curve.Type == "const" then
++        return t >= 1 and 1 or 0
++    elseif curve.Type == "bounce" then
++        return OutBounce(t)
++    elseif curve.Type == "elastic" then
++        return OutElastic(t)
++    end
++end
++
++-- Single place that turns "how far between two keyframes" into the lerp multiplier.
++-- A curve on the previous keyframe wins; otherwise the old ease in/out numbers apply.
++function SMH.ApplyEasing(prevKeyframe, nextKeyframe, modname, t)
++    local curve = prevKeyframe.Curve and prevKeyframe.Curve[modname]
++    if curve then
++        local eased = MGR.Eval(curve, t)
++        if eased ~= nil then return eased end
++    end
++    return math.EaseInOut(t, prevKeyframe.EaseOut[modname], nextKeyframe.EaseIn[modname])
++end
+diff --git a/lua/smh/shared/saves.lua b/lua/smh/shared/saves.lua
+index 9c8e14a..6aecee0 100644
+--- a/lua/smh/shared/saves.lua
++++ b/lua/smh/shared/saves.lua
+@@ -60,6 +60,7 @@ local function ProcessKeyframes(keyframes, entityMappedKeyframes, properties, pl
+             Position = keyframe.Frame,
+             EaseIn = table.Copy(keyframe.EaseIn),
+             EaseOut = table.Copy(keyframe.EaseOut),
++            Curve = table.Copy(keyframe.Curve or {}),
+             EntityData = table.Copy(keyframe.Modifiers),
+         })
+     end
+diff --git a/lua/smh/shared/tablesplit.lua b/lua/smh/shared/tablesplit.lua
+index 492f528..070e75a 100644
+--- a/lua/smh/shared/tablesplit.lua
++++ b/lua/smh/shared/tablesplit.lua
+@@ -5,7 +5,7 @@ local listAssembling = {}
+ local MGR = {} -- btw D stands for "deconstruct", A for "Assemble"
+ 
+ function MGR.DKeyframes(keyframes)
+-    local IDs, ents, Frame, In, Out, ModCount, Modifiers = {}, {}, {}, {}, {}, {}, {}
++    local IDs, ents, Frame, In, Out, Curve, ModCount, Modifiers = {}, {}, {}, {}, {}, {}, {}, {}
+     local i = 0
+     for _, keyframe in pairs(keyframes) do
+         i = i + 1
+@@ -13,26 +13,28 @@ function MGR.DKeyframes(keyframes)
+         IDs[i] = keyframe.ID
+         Frame[i] = keyframe.Frame
+         ents[i] = keyframe.Entity
+-        Modifiers[i], In[i], Out[i] = {}, {}, {}
++        Modifiers[i], In[i], Out[i], Curve[i] = {}, {}, {}, {}
+         ModCount[i] = 0
+         for name, data in pairs(keyframe.Modifiers) do
+             ModCount[i] = ModCount[i] + 1
+             Modifiers[i][ModCount[i]] = name
+             In[i][ModCount[i]] = keyframe.EaseIn[name]
+             Out[i][ModCount[i]] = keyframe.EaseOut[name]
++            Curve[i][ModCount[i]] = keyframe.Curve and keyframe.Curve[name] or ""
+         end
+     end
+ 
+-    return i, IDs, ents, Frame, In, Out, ModCount, Modifiers
++    return i, IDs, ents, Frame, In, Out, ModCount, Modifiers, Curve
+ end
+ 
+-function MGR.AKeyframes(ID, entity, Frame, In, Out, Modifiers)
++function MGR.AKeyframes(ID, entity, Frame, In, Out, Modifiers, Curve)
+     local keyframe = {}
+     keyframe.ID = ID
+     keyframe.Entity = entity
+     keyframe.Frame = Frame
+     keyframe.EaseIn = table.Copy(In)
+     keyframe.EaseOut = table.Copy(Out)
++    keyframe.Curve = table.Copy(Curve or {})
+     keyframe.Modifiers = table.Copy(Modifiers)
+ 
+     table.insert(keyframesAssembling, keyframe)
